@@ -1,0 +1,9 @@
+{
+    "display_name": "ExtBlocks Manual Trigger",
+    "loading_order": 110,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "author": "local",
+    "version": "1.0.0"
+}
