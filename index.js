@@ -5,26 +5,43 @@
  *
  * It imports ExtBlocks' own modules (same URLs => same module instances),
  * so it runs blocks exactly like the /ExtBlocks slash commands do.
+ *
+ * Inline Image Generation (<img data-iig-instruction ... src="[IMG:GEN]">) only
+ * scans a message when SillyTavern fires a "message rendered" event. A manual run
+ * fires none, so after a block finishes we call that extension's own
+ * processMessageTags() for the message (toggle in the panel).
  */
 
 const MODULE_NAME = 'extblocks_manual_trigger';
 const LOG = '[ExtBlocks Manual Trigger]';
 const KNOWN_FOLDERS = ['ext-blocks-custom', 'ExtBlocks', 'extblocks'];
+const KNOWN_IIG_FOLDERS = ['sillyimages', 'SillyTavern-Inline-Image-Generation', 'inline-image-generation'];
 
 const { eventSource, event_types, extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
 
 let ext = null;   // resolved ExtBlocks modules
 let busy = false; // one manual run at a time
 
+const DEFAULT_SETTINGS = { folder: '', processImages: true, iigFolder: '' };
+
 function getSettings() {
     if (!extensionSettings[MODULE_NAME]) {
-        extensionSettings[MODULE_NAME] = { folder: '' };
+        extensionSettings[MODULE_NAME] = {};
     }
-    return extensionSettings[MODULE_NAME];
+    const st = extensionSettings[MODULE_NAME];
+    for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
+        if (st[k] === undefined) st[k] = v;
+    }
+    return st;
 }
 
-/** Possible base URLs of the ExtBlocks extension folder, best guesses first. */
-function candidateBases() {
+/**
+ * Possible base URLs of another extension's folder, best guesses first.
+ * @param {string} overrideName folder name typed by the user (may be empty)
+ * @param {RegExp} preferred    folders matching this are tried first
+ * @param {string[]} known      well-known folder names to try as siblings
+ */
+function candidateBases(overrideName, preferred, known) {
     const own = new URL('./', import.meta.url).href;
     const matching = [];
     const rest = [];
@@ -33,16 +50,16 @@ function candidateBases() {
     const add = (href) => {
         if (seen.has(href)) return;
         seen.add(href);
-        (/ext-?blocks/i.test(href) ? matching : rest).push(href);
+        (preferred.test(href) ? matching : rest).push(href);
     };
 
-    const override = String(getSettings().folder || '').trim();
+    const override = String(overrideName || '').trim();
     const overrideHref = override ? new URL(`../${encodeURIComponent(override)}/`, own).href : null;
 
     document.querySelectorAll('script[src]').forEach((s) => {
         if (/\/extensions\/.+\/index\.js(\?.*)?$/.test(s.src)) add(new URL('./', s.src).href);
     });
-    KNOWN_FOLDERS.forEach((f) => add(new URL(`../${f}/`, own).href));
+    known.forEach((f) => add(new URL(`../${f}/`, own).href));
 
     return [...(overrideHref ? [overrideHref] : []), ...matching, ...rest];
 }
@@ -52,7 +69,7 @@ async function loadExtBlocks(force = false) {
     if (ext && !force) return ext;
     ext = null;
 
-    for (const base of candidateBases()) {
+    for (const base of candidateBases(getSettings().folder, /ext-?blocks/i, KNOWN_FOLDERS)) {
         try {
             const [cmd, blocks, gen, apiMod, consts] = await Promise.all([
                 import(`${base}src/services/CommandService.js`),
@@ -78,6 +95,39 @@ async function loadExtBlocks(force = false) {
         }
     }
     return null;
+}
+
+/** Finds the Inline Image Generation extension (optional). Returns its processMessageTags or null. */
+let iigProcess;
+async function loadIig() {
+    if (iigProcess !== undefined) return iigProcess;
+    iigProcess = null;
+    for (const base of candidateBases(getSettings().iigFolder, /sillyimages|image/i, KNOWN_IIG_FOLDERS)) {
+        try {
+            const mod = await import(`${base}src/pipeline.js`);
+            if (typeof mod.processMessageTags === 'function') {
+                iigProcess = mod.processMessageTags;
+                console.log(`${LOG} using Inline Image Generation at ${base}`);
+                return iigProcess;
+            }
+        } catch {
+            // not this folder
+        }
+    }
+    return iigProcess;
+}
+
+/** Lets Inline Image Generation pick up [IMG:GEN] tags the block just wrote. */
+async function processImages(messageId) {
+    if (!getSettings().processImages) return;
+    const processTags = await loadIig();
+    if (!processTags) {
+        console.warn(`${LOG} Inline Image Generation not found, skipping image processing`);
+        return;
+    }
+    // small delay so ExtBlocks has finished updating the message HTML
+    await new Promise((r) => setTimeout(r, 300));
+    await processTags(messageId);
 }
 
 function typeLabel(block, BlockType) {
@@ -118,6 +168,7 @@ async function runBlock(name, $btn) {
     const extra = String($('#extblocks_run_extra').val() || '').trim();
     const { BlockType, CommandService, GenerationService } = api;
     const type = block.block_type ?? BlockType.GENERATED;
+    const messageId = chat.length - 1;
 
     busy = true;
     $('.extblocks-run-btn').addClass('disabled');
@@ -136,10 +187,11 @@ async function runBlock(name, $btn) {
         } else if (type === BlockType.ACCUMULATION) {
             // Applies this one accumulation block to the last message
             // (only does something if the message contains its <updater> tag).
-            const messageId = chat.length - 1;
             await GenerationService.handleBlocksAccumulation(messageId, !!chat[messageId].is_user, [block]);
         }
         toastr.success(`Finished "${name}".`, 'ExtBlocks');
+        // not awaited: image generation can take a while and shows its own progress
+        processImages(messageId).catch((e) => console.error(`${LOG} image processing failed`, e));
     } catch (err) {
         console.error(`${LOG} run failed`, err);
         toastr.error(`"${name}" failed: ${err?.message ?? err}`, 'ExtBlocks');
@@ -204,15 +256,23 @@ function buildPanel() {
                 </div>
                 <small id="extblocks_run_status" style="display:block;margin:6px 0;"></small>
                 <div id="extblocks_run_list"></div>
+                <label class="checkbox_label" style="margin-top:6px;"
+                    title="Inline Image Generation only scans messages when a render event fires. Manual runs fire none, so this triggers it for you.">
+                    <input id="extblocks_run_images" type="checkbox">
+                    <small>After a run, generate images from [IMG:GEN] tags (Inline Image Generation)</small>
+                </label>
                 <details style="margin-top:6px;">
-                    <summary><small>ExtBlocks folder name (only if auto-detect fails)</small></summary>
-                    <input id="extblocks_run_folder" class="text_pole" type="text" placeholder="e.g. ext-blocks-custom">
+                    <summary><small>Folder names (only if auto-detect fails)</small></summary>
+                    <input id="extblocks_run_folder" class="text_pole" type="text" placeholder="ExtBlocks folder, e.g. ext-blocks-custom">
+                    <input id="extblocks_run_iigfolder" class="text_pole" type="text" placeholder="Inline Image Generation folder, e.g. sillyimages">
                 </details>
             </div>
         </div>
     </div>`;
     $('#extensions_settings').append(html);
     $('#extblocks_run_folder').val(getSettings().folder || '');
+    $('#extblocks_run_iigfolder').val(getSettings().iigFolder || '');
+    $('#extblocks_run_images').prop('checked', !!getSettings().processImages);
 }
 
 function bindUi() {
@@ -227,6 +287,17 @@ function bindUi() {
         getSettings().folder = String($(this).val() || '').trim();
         saveSettingsDebounced();
         await refreshList();
+    });
+
+    $('#extblocks_run_images').on('change', function () {
+        getSettings().processImages = $(this).prop('checked');
+        saveSettingsDebounced();
+    });
+
+    $('#extblocks_run_iigfolder').on('change', function () {
+        getSettings().iigFolder = String($(this).val() || '').trim();
+        iigProcess = undefined; // re-detect next time
+        saveSettingsDebounced();
     });
 
     // Re-read the list whenever the drawer is opened
